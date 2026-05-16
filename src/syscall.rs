@@ -8,10 +8,10 @@ use core::mem::size_of;
 
 use crate::errors::{status_to_result, AbiError, AbiResult, AlaniStatus};
 use crate::handles::{
-    CapabilityRights, CAP_ATTEST, CAP_AUDIT_APPEND, CAP_AUDIT_QUERY, CAP_AUDIT_VERIFY,
-    CAP_CAPABILITY_ADMIN, CAP_COGNITION_INFER, CAP_COGNITION_MEMORY_WRITE, CAP_DEVICE_CALL,
-    CAP_DEVICE_LIST, CAP_DEVICE_OPEN, CAP_MEMORY_MAP, CAP_MEMORY_SHARE, CAP_RANDOM,
-    CAP_TASK_MANAGE, CAP_TASK_SPAWN, CAP_TRACE_CONTEXT,
+    CapabilityHandle, CapabilityRights, CAP_ATTEST, CAP_AUDIT_APPEND, CAP_AUDIT_QUERY,
+    CAP_AUDIT_VERIFY, CAP_CAPABILITY_ADMIN, CAP_COGNITION_INFER, CAP_COGNITION_MEMORY_WRITE,
+    CAP_DEVICE_CALL, CAP_DEVICE_LIST, CAP_DEVICE_OPEN, CAP_MEMORY_MAP, CAP_MEMORY_SHARE,
+    CAP_RANDOM, CAP_TASK_MANAGE, CAP_TASK_SPAWN, CAP_TRACE_CONTEXT,
 };
 use crate::version::{AbiVersion, ALANI_ABI_FEATURES, ALANI_ABI_VERSION};
 
@@ -129,13 +129,44 @@ impl UserBuffer {
         if self.reserved != 0 || self.flags & !USER_BUFFER_KNOWN_FLAGS != 0 {
             return Err(AbiError::ReservedBits);
         }
+        if self.flags & (USER_BUFFER_READ | USER_BUFFER_WRITE) == 0 {
+            return Err(AbiError::InvalidBuffer);
+        }
         if self.ptr == 0 || self.len == 0 {
             return Err(AbiError::InvalidBuffer);
         }
         if self.len > DEFAULT_MAX_USER_BUFFER_LEN {
             return Err(AbiError::BufferTooLarge);
         }
+        if self.checked_end().is_err() {
+            return Err(AbiError::InvalidBuffer);
+        }
         Ok(())
+    }
+
+    /// Returns the exclusive end address after checking for overflow.
+    pub const fn checked_end(self) -> AbiResult<u64> {
+        match self.ptr.checked_add(self.len) {
+            Some(end) => Ok(end),
+            None => Err(AbiError::InvalidBuffer),
+        }
+    }
+
+    /// Validates that the user pointer is aligned to `alignment`.
+    pub const fn validate_alignment(self, alignment: u64) -> AbiResult<()> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(AbiError::InvalidArgument);
+        }
+        match self.validate() {
+            Ok(()) => {
+                if self.ptr & (alignment - 1) == 0 {
+                    Ok(())
+                } else {
+                    Err(AbiError::InvalidBuffer)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Returns `true` when the buffer declares kernel-read access.
@@ -343,12 +374,12 @@ pub enum SyscallNumber {
     SysDeviceCall = 0x0302,
     /// Close a device.
     SysDeviceClose = 0x0303,
-    /// List cognitive models.
-    SysModelList = 0x0400,
-    /// Open a cognitive model handle.
-    SysModelOpen = 0x0401,
     /// Invoke deterministic model-device mediation.
-    SysInfer = 0x0402,
+    SysInfer = 0x0400,
+    /// List cognitive models.
+    SysModelList = 0x0401,
+    /// Open a cognitive model handle.
+    SysModelOpen = 0x0402,
     /// Query cognitive memory.
     SysMemoryQuery = 0x0403,
     /// Put a cognitive memory record.
@@ -391,9 +422,9 @@ impl SyscallNumber {
             0x0301 => Some(Self::SysDeviceOpen),
             0x0302 => Some(Self::SysDeviceCall),
             0x0303 => Some(Self::SysDeviceClose),
-            0x0400 => Some(Self::SysModelList),
-            0x0401 => Some(Self::SysModelOpen),
-            0x0402 => Some(Self::SysInfer),
+            0x0400 => Some(Self::SysInfer),
+            0x0401 => Some(Self::SysModelList),
+            0x0402 => Some(Self::SysModelOpen),
             0x0403 => Some(Self::SysMemoryQuery),
             0x0404 => Some(Self::SysMemoryPut),
             0x0500 => Some(Self::SysCapDerive),
@@ -571,6 +602,53 @@ impl SyscallFrame {
             Err(error) => Err(error),
         }
     }
+
+    /// Returns the canonical descriptor for this frame.
+    pub fn descriptor(self) -> AbiResult<&'static SyscallDescriptor> {
+        match self.syscall_number() {
+            Ok(number) => descriptor(number).ok_or(AbiError::UnknownSyscall),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Validates syscall number, trace context, and execution context.
+    pub fn validate_for_context(self, context: ExecutionContext) -> AbiResult<()> {
+        self.validate()?;
+        let descriptor = self.descriptor()?;
+        if descriptor.allows_context(context) {
+            Ok(())
+        } else {
+            Err(AbiError::InvalidContext)
+        }
+    }
+
+    /// Validates that `capability` has the rights required by this syscall.
+    pub fn authorize(self, capability: CapabilityHandle) -> AbiResult<()> {
+        let descriptor = self.descriptor()?;
+        if descriptor.required_rights.is_empty() {
+            Ok(())
+        } else {
+            capability.require(descriptor.required_rights)
+        }
+    }
+
+    /// Validates frame, execution context, and optional capability in one step.
+    pub fn validate_dispatch(
+        self,
+        context: ExecutionContext,
+        capability: Option<CapabilityHandle>,
+    ) -> AbiResult<&'static SyscallDescriptor> {
+        self.validate_for_context(context)?;
+        let descriptor = self.descriptor()?;
+        if descriptor.required_rights.is_empty() {
+            return Ok(descriptor);
+        }
+        match capability {
+            Some(capability) => capability.require(descriptor.required_rights)?,
+            None => return Err(AbiError::MissingCapability),
+        }
+        Ok(descriptor)
+    }
 }
 
 /// Result register payload returned by the kernel dispatcher.
@@ -688,6 +766,16 @@ pub struct SyscallDescriptor {
 }
 
 impl SyscallDescriptor {
+    /// Returns `true` when this syscall requires a capability.
+    pub const fn requires_capability(self) -> bool {
+        !self.required_rights.is_empty()
+    }
+
+    /// Returns `true` when this syscall has audit-relevant metadata.
+    pub const fn requires_audit(self) -> bool {
+        !matches!(self.audit_event, AuditEvent::None)
+    }
+
     /// Returns `true` when the descriptor allows the execution context.
     pub const fn allows_context(self, context: ExecutionContext) -> bool {
         let required = match context {
@@ -703,8 +791,14 @@ impl SyscallDescriptor {
         if self.context_flags & !SYSCALL_CONTEXT_KNOWN_FLAGS != 0 {
             return Err(AbiError::ReservedBits);
         }
+        if self.context_flags == 0 {
+            return Err(AbiError::InvalidContext);
+        }
         if self.name.is_empty() {
             return Err(AbiError::InvalidArgument);
+        }
+        if self.required_rights.validate().is_err() {
+            return Err(AbiError::ReservedBits);
         }
         Ok(())
     }
@@ -870,7 +964,7 @@ pub const SYSCALL_TABLE: [SyscallDescriptor; SYSCALL_TABLE_LEN] = [
         required_rights: CapabilityRights(CAP_DEVICE_CALL),
         audit_event: AuditEvent::Device,
         context_flags: TASK_CONTEXT,
-        args: [HANDLE, VALUE, USER_PTR, USER_PTR, LENGTH, FLAGS],
+        args: [HANDLE, VALUE, USER_PTR, LENGTH, USER_PTR, LENGTH],
     },
     SyscallDescriptor {
         number: SyscallNumber::SysDeviceClose,
@@ -881,12 +975,20 @@ pub const SYSCALL_TABLE: [SyscallDescriptor; SYSCALL_TABLE_LEN] = [
         args: [HANDLE, NONE, NONE, NONE, NONE, NONE],
     },
     SyscallDescriptor {
+        number: SyscallNumber::SysInfer,
+        name: "sys_infer",
+        required_rights: CapabilityRights(CAP_COGNITION_INFER),
+        audit_event: AuditEvent::Cognition,
+        context_flags: TASK_CONTEXT,
+        args: [HANDLE, USER_PTR, LENGTH, VALUE, USER_PTR, LENGTH],
+    },
+    SyscallDescriptor {
         number: SyscallNumber::SysModelList,
         name: "sys_model_list",
         required_rights: CapabilityRights::EMPTY,
         audit_event: AuditEvent::None,
         context_flags: TASK_CONTEXT,
-        args: [USER_PTR, LENGTH, NONE, NONE, NONE, NONE],
+        args: [USER_PTR, LENGTH, FLAGS, NONE, NONE, NONE],
     },
     SyscallDescriptor {
         number: SyscallNumber::SysModelOpen,
@@ -897,20 +999,12 @@ pub const SYSCALL_TABLE: [SyscallDescriptor; SYSCALL_TABLE_LEN] = [
         args: [VALUE, FLAGS, NONE, NONE, NONE, NONE],
     },
     SyscallDescriptor {
-        number: SyscallNumber::SysInfer,
-        name: "sys_infer",
-        required_rights: CapabilityRights(CAP_COGNITION_INFER),
-        audit_event: AuditEvent::Cognition,
-        context_flags: TASK_CONTEXT,
-        args: [HANDLE, USER_PTR, USER_PTR, STRUCT_PTR, NONE, NONE],
-    },
-    SyscallDescriptor {
         number: SyscallNumber::SysMemoryQuery,
         name: "sys_memory_query",
         required_rights: CapabilityRights(CAP_COGNITION_INFER),
         audit_event: AuditEvent::Cognition,
         context_flags: TASK_CONTEXT,
-        args: [USER_PTR, USER_PTR, LENGTH, NONE, NONE, NONE],
+        args: [USER_PTR, LENGTH, USER_PTR, LENGTH, NONE, NONE],
     },
     SyscallDescriptor {
         number: SyscallNumber::SysMemoryPut,

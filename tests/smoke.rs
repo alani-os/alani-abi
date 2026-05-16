@@ -105,6 +105,8 @@ fn user_buffers_validate_direction_reserved_bits_and_limits() {
     assert!(read.is_readable());
     assert!(!read.is_writable());
     assert_eq!(read.validate(), Ok(()));
+    assert_eq!(read.checked_end(), Ok(read.ptr + read.len));
+    assert_eq!(read.validate_alignment(1), Ok(()));
     assert_eq!(read.ptr_len_args(), [read.ptr, read.len]);
 
     let mut output = [0_u8; 8];
@@ -125,6 +127,18 @@ fn user_buffers_validate_direction_reserved_bits_and_limits() {
     assert_eq!(
         UserBuffer::new(0x1000, 16, 1 << 31).validate(),
         Err(AbiError::ReservedBits)
+    );
+    assert_eq!(
+        UserBuffer::new(0x1000, 16, 0).validate(),
+        Err(AbiError::InvalidBuffer)
+    );
+    assert_eq!(
+        UserBuffer::new(u64::MAX, 16, USER_BUFFER_READ).validate(),
+        Err(AbiError::InvalidBuffer)
+    );
+    assert_eq!(
+        UserBuffer::new(0x1003, 16, USER_BUFFER_READ).validate_alignment(4),
+        Err(AbiError::InvalidBuffer)
     );
 }
 
@@ -164,10 +178,19 @@ fn syscall_numbers_and_descriptor_table_are_canonical() {
         Some(SyscallNumber::SysTaskSpawn)
     );
     assert_eq!(
-        SyscallNumber::from_raw(0x0402),
+        SyscallNumber::from_raw(0x0400),
         Some(SyscallNumber::SysInfer)
     );
+    assert_eq!(
+        SyscallNumber::from_raw(0x0401),
+        Some(SyscallNumber::SysModelList)
+    );
+    assert_eq!(
+        SyscallNumber::from_raw(0x0402),
+        Some(SyscallNumber::SysModelOpen)
+    );
     assert_eq!(SyscallNumber::SysDeviceCall.raw(), 0x0302);
+    assert_eq!(SyscallNumber::SysInfer.raw(), 0x0400);
     assert_eq!(SyscallNumber::SysInfer.name(), "sys_infer");
     assert_eq!(SyscallNumber::SysInfer.group(), SyscallGroup::Cognition);
     assert_eq!(descriptor_from_raw(0xffff), None);
@@ -183,6 +206,8 @@ fn syscall_numbers_and_descriptor_table_are_canonical() {
     assert!(infer
         .required_rights
         .contains(CapabilityRights(CAP_COGNITION_INFER)));
+    assert!(infer.requires_capability());
+    assert!(infer.requires_audit());
     assert!(infer.allows_context(ExecutionContext::Task));
     assert!(!infer.allows_context(ExecutionContext::EarlyBoot));
 }
@@ -191,10 +216,35 @@ fn syscall_numbers_and_descriptor_table_are_canonical() {
 fn syscall_frames_returns_and_sys_info_validate() {
     let frame = SyscallFrame::new(SyscallNumber::SysInfo, [0; 6]);
     assert_eq!(frame.validate(), Ok(()));
+    assert_eq!(
+        frame
+            .validate_dispatch(ExecutionContext::EarlyBoot, None)
+            .unwrap()
+            .number,
+        SyscallNumber::SysInfo
+    );
     assert_eq!(frame.syscall_number(), Ok(SyscallNumber::SysInfo));
     assert_eq!(
         SyscallFrame::raw(0xffff, [0; 6]).validate(),
         Err(AbiError::UnknownSyscall)
+    );
+
+    let infer = SyscallFrame::new(SyscallNumber::SysInfer, [0; 6]);
+    assert_eq!(
+        infer.validate_for_context(ExecutionContext::EarlyBoot),
+        Err(AbiError::InvalidContext)
+    );
+    assert_eq!(
+        infer.validate_dispatch(ExecutionContext::Task, None),
+        Err(AbiError::MissingCapability)
+    );
+    let cap = CapabilityHandle::new(9, CapabilityRights(CAP_COGNITION_INFER), 42, 1);
+    assert_eq!(
+        infer
+            .validate_dispatch(ExecutionContext::Task, Some(cap))
+            .unwrap()
+            .number,
+        SyscallNumber::SysInfer
     );
 
     let invalid_trace = SyscallFrame {

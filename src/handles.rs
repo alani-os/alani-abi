@@ -170,9 +170,23 @@ impl CapabilityRights {
         self.0 & required.0 == required.0
     }
 
+    /// Returns `true` when no rights are present.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
     /// Returns the union of two rights sets.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    /// Validates that no reserved rights bits are present.
+    pub const fn validate(self) -> AbiResult<()> {
+        if self.0 & !KNOWN_CAPABILITY_RIGHTS != 0 {
+            Err(AbiError::ReservedBits)
+        } else {
+            Ok(())
+        }
     }
 }
 
